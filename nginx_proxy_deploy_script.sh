@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Nginx反向代理一键部署脚本
-# 适用于CentOS 7系统
+# 适用于CentOS 7 和 Ubuntu 系统
 # 作者: Assistant
-# 版本: 1.1 (修复版)
+# 版本: 1.2 (添加Ubuntu支持)
 
 set -e  # 遇到错误立即退出
 
@@ -13,6 +13,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# 全局OS变量
+OS=""
+OS_VERSION=""
 
 # 日志函数
 log_info() {
@@ -31,7 +35,7 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# 检查是否为root用户
+# 检查是否为root用户（脚本不建议以root直接运行）
 check_root() {
     if [[ $EUID -eq 0 ]]; then
         log_error "请不要使用root用户直接运行此脚本"
@@ -40,20 +44,42 @@ check_root() {
     fi
 }
 
-# 检查系统版本
+# 检查系统版本并设置OS变量（支持CentOS 7 和 Ubuntu）
 check_system() {
-    if [[ ! -f /etc/redhat-release ]]; then
-        log_error "此脚本仅支持CentOS 7系统"
-        exit 1
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        ID_L=$(echo "${ID:-}" | tr '[:upper:]' '[:lower:]')
+        VERSION_ID_STR="${VERSION_ID:-}"
     fi
-    
-    local version=$(cat /etc/redhat-release | grep -oE '[0-9]+' | head -n1)
-    if [[ "$version" != "7" ]]; then
-        log_error "此脚本仅支持CentOS 7系统，当前系统版本: $version"
-        exit 1
+
+    # CentOS 7 检查（保留之前的 /etc/redhat-release 检查方式作为兼容）
+    if [[ -f /etc/redhat-release ]]; then
+        if grep -qi 'CentOS' /etc/redhat-release || grep -qi 'Red Hat' /etc/redhat-release; then
+            local version=$(cat /etc/redhat-release | grep -oE '[0-9]+' | head -n1)
+            if [[ "$version" == "7" ]]; then
+                OS="centos"
+                OS_VERSION="7"
+                log_success "系统检查通过: CentOS 7"
+                return 0
+            else
+                log_error "此脚本仅支持CentOS 7 或 Ubuntu 系统，检测到: $(cat /etc/redhat-release)"
+                exit 1
+            fi
+        fi
     fi
-    
-    log_success "系统检查通过: CentOS 7"
+
+    # Ubuntu 检查
+    if [[ "$ID_L" == "ubuntu" ]]; then
+        # 允许所有较新的 ubuntu 版本 (18.04+ 推荐)
+        OS="ubuntu"
+        OS_VERSION="$VERSION_ID_STR"
+        log_success "系统检查通过: Ubuntu $OS_VERSION"
+        return 0
+    fi
+
+    log_error "此脚本仅支持 CentOS 7 或 Ubuntu 系统，当前系统不受支持"
+    exit 1
 }
 
 # 收集用户配置
@@ -115,40 +141,92 @@ collect_config() {
     fi
 }
 
-# 安装依赖
+
+# 安装依赖（根据OS变量选择包管理器）
 install_dependencies() {
-    log_info "更新系统包..."
-    sudo yum update -y
-    
-    log_info "安装EPEL仓库..."
-    sudo yum install -y epel-release
-    
-    log_info "安装Nginx..."
-    sudo yum install -y nginx
-    
-    log_info "安装Certbot..."
-    sudo yum install -y certbot python2-certbot-nginx
-    
+    log_info "安装依赖 (OS=$OS)..."
+
+    if [[ "$OS" == "centos" ]]; then
+        log_info "更新系统包..."
+        sudo yum update -y
+        
+        log_info "安装EPEL仓库..."
+        sudo yum install -y epel-release
+        
+        log_info "安装Nginx..."
+        sudo yum install -y nginx
+        
+        log_info "安装Certbot..."
+        sudo yum install -y certbot python2-certbot-nginx
+
+    elif [[ "$OS" == "ubuntu" ]]; then
+        log_info "更新系统包..."
+        sudo apt-get update -y
+
+        log_info "安装必要工具..."
+        sudo apt-get install -y software-properties-common apt-transport-https ca-certificates
+
+        log_info "安装Nginx..."
+        sudo apt-get install -y nginx
+
+        log_info "安装Certbot (apt 版本，Ubuntu 上可能推荐使用 snap 在新版系统上安装证书工具)..."
+        # 使用 apt 提供的 certbot 和 nginx 插件
+        sudo apt-get install -y certbot python3-certbot-nginx || {
+            log_warning "apt 安装 certbot 失败，尝试通过 snap 安装（需要 snapd）"
+            sudo apt-get install -y snapd
+            sudo snap install core; sudo snap refresh core
+            sudo snap install --classic certbot
+            sudo ln -s /snap/bin/certbot /usr/bin/certbot || true
+        }
+    else
+        log_error "未知操作系统: $OS"
+        exit 1
+    fi
+
     log_success "依赖安装完成"
 }
 
-# 配置防火墙
+# 配置防火墙（支持 firewalld 与 ufw）
 setup_firewall() {
-    log_info "配置防火墙..."
+    log_info "配置防火墙 (OS=$OS)..."
     
-    # 检查firewalld是否运行
-    if ! sudo systemctl is-active --quiet firewalld; then
-        log_warning "firewalld未运行，启动firewalld..."
-        sudo systemctl start firewalld
-        sudo systemctl enable firewalld
+    if [[ "$OS" == "centos" ]]; then
+        # 检查firewalld是否运行
+        if ! sudo systemctl is-active --quiet firewalld; then
+            log_warning "firewalld未运行，启动firewalld..."
+            sudo systemctl start firewalld
+            sudo systemctl enable firewalld
+        fi
+        
+        # 开放端口
+        sudo firewall-cmd --permanent --add-port=${HTTPS_PORT}/tcp
+        sudo firewall-cmd --permanent --add-port=${HTTP_PORT}/tcp
+        sudo firewall-cmd --permanent --add-port=80/tcp  # HTTP验证需要
+        sudo firewall-cmd --reload
+
+    elif [[ "$OS" == "ubuntu" ]]; then
+        # 使用 ufw
+        if ! command -v ufw >/dev/null 2>&1; then
+            log_info "安装 ufw..."
+            sudo apt-get install -y ufw
+        fi
+
+        # 如果 ufw 未启用，先允许必要端口再启用（避免被锁死）
+        sudo ufw allow "${HTTPS_PORT}/tcp" || true
+        sudo ufw allow "${HTTP_PORT}/tcp" || true
+        sudo ufw allow "80/tcp" || true
+
+        # 启用 ufw（如果未启用）
+        if ! sudo ufw status | grep -qi "Status: active"; then
+            log_info "启用 ufw 防火墙..."
+            sudo ufw --force enable
+        else
+            sudo ufw reload || true
+        fi
+    else
+        log_warning "跳过防火墙配置：未知操作系统 $OS"
     fi
-    
-    # 开放端口
-    sudo firewall-cmd --permanent --add-port=${HTTPS_PORT}/tcp
-    sudo firewall-cmd --permanent --add-port=${HTTP_PORT}/tcp
-    sudo firewall-cmd --permanent --add-port=80/tcp  # HTTP验证需要
-    sudo firewall-cmd --reload
-    
+
     log_success "防火墙配置完成"
 }
 
@@ -158,7 +236,7 @@ setup_ssl() {
     
     # 检查域名解析
     log_info "检查域名解析..."
-    if ! nslookup $FULL_DOMAIN > /dev/null 2>&1; then
+    if ! nslookup "$FULL_DOMAIN" > /dev/null 2>&1; then
         log_warning "域名解析检查失败，请确保域名已正确解析到此服务器"
         read -p "是否继续? (y/N): " CONTINUE
         if [[ "$CONTINUE" != "y" && "$CONTINUE" != "Y" ]]; then
@@ -170,7 +248,7 @@ setup_ssl() {
     sudo systemctl stop nginx 2>/dev/null || true
     
     # 申请证书
-    if sudo certbot certonly --standalone -d $FULL_DOMAIN --email $EMAIL --agree-tos --non-interactive; then
+    if sudo certbot certonly --standalone -d "$FULL_DOMAIN" --email "$EMAIL" --agree-tos --non-interactive; then
         log_success "SSL证书申请成功"
     else
         log_error "SSL证书申请失败，请检查域名解析和网络连接"
@@ -187,7 +265,7 @@ generate_nginx_config() {
     
     # 生成主配置文件
     sudo tee /etc/nginx/nginx.conf > /dev/null <<'EOF'
-user nginx;
+user root;
 worker_processes auto;
 error_log /var/log/nginx/error.log;
 pid /run/nginx.pid;
@@ -594,7 +672,7 @@ cleanup_on_error() {
 main() {
     echo "=========================================="
     echo "     Nginx API反向代理一键部署脚本"
-    echo "     版本: 1.1 (修复版)"
+    echo "     版本: 1.2 (添加Ubuntu支持)"
     echo "=========================================="
     echo
     
