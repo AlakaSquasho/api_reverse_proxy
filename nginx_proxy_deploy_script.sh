@@ -198,10 +198,34 @@ setup_firewall() {
             sudo systemctl enable firewalld
         fi
         
-        # 开放端口
+        # 保存现有防火墙规则
+        log_info "保存现有防火墙规则..."
+        local existing_ports=$(sudo firewall-cmd --list-ports)
+        log_info "当前开放的端口: $existing_ports"
+        
+        # 确保基本服务端口开放
+        # SSH端口
+        sudo firewall-cmd --permanent --add-port=22/tcp || true
+        # FTP端口
+        sudo firewall-cmd --permanent --add-port=21/tcp || true
+        # DNS端口
+        sudo firewall-cmd --permanent --add-port=53/tcp || true
+        sudo firewall-cmd --permanent --add-port=53/udp || true
+        
+        # 开放代理服务端口
         sudo firewall-cmd --permanent --add-port=${HTTPS_PORT}/tcp
         sudo firewall-cmd --permanent --add-port=${HTTP_PORT}/tcp
         sudo firewall-cmd --permanent --add-port=80/tcp  # HTTP验证需要
+        sudo firewall-cmd --permanent --add-port=443/tcp # HTTPS标准端口
+        
+        # 如果有现有端口规则，重新添加
+        if [[ -n "$existing_ports" ]]; then
+            for port in $existing_ports; do
+                sudo firewall-cmd --permanent --add-port=$port || true
+            done
+        fi
+        
+        # 重新载入规则
         sudo firewall-cmd --reload
 
     elif [[ "$OS" == "ubuntu" ]]; then
@@ -211,10 +235,22 @@ setup_firewall() {
             sudo apt-get install -y ufw
         fi
 
-        # 如果 ufw 未启用，先允许必要端口再启用（避免被锁死）
+        # 保存现有防火墙规则
+        log_info "保存现有 UFW 规则..."
+        local existing_rules=$(sudo ufw status numbered | grep ALLOW)
+        log_info "当前 UFW 规则: $existing_rules"
+
+        # 确保基本服务端口开放（在启用 UFW 前）
+        sudo ufw allow 22/tcp || true    # SSH
+        sudo ufw allow 21/tcp || true    # FTP
+        sudo ufw allow 53/tcp || true    # DNS
+        sudo ufw allow 53/udp || true    # DNS
+        sudo ufw allow 443/tcp || true   # HTTPS
+
+        # 开放代理服务端口
         sudo ufw allow "${HTTPS_PORT}/tcp" || true
         sudo ufw allow "${HTTP_PORT}/tcp" || true
-        sudo ufw allow "80/tcp" || true
+        sudo ufw allow "80/tcp" || true  # HTTP验证需要
 
         # 启用 ufw（如果未启用）
         if ! sudo ufw status | grep -qi "Status: active"; then
