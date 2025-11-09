@@ -597,7 +597,7 @@ run_tests() {
     # 测试速率限制
     log_info "测试速率限制功能..."
     local rate_limit_triggered=false
-    for i in {1..25}; do
+    for ((i=1; i<=RATE_LIMIT+5; i++)); do
         if ! curl -s -f -k "https://${FULL_DOMAIN}:${HTTPS_PORT}/health" > /dev/null; then
             rate_limit_triggered=true
             break
