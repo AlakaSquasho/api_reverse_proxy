@@ -164,7 +164,7 @@ install_dependencies() {
         sudo apt-get update -y
 
         log_info "安装必要工具..."
-        sudo apt-get install -y software-properties-common apt-transport-https ca-certificates
+        sudo apt-get install -y software-properties-common apt-transport-https ca-certificates cron
 
         log_info "安装Nginx..."
         sudo apt-get install -y nginx
@@ -518,10 +518,34 @@ EOF
 setup_ssl_renewal() {
     log_info "配置SSL证书自动续期..."
     
-    # 添加到crontab
-    (crontab -l 2>/dev/null; echo "0 2 * * * /usr/bin/certbot renew --quiet && systemctl reload nginx") | crontab -
+    # 检查cron服务是否安装和运行
+    if ! command -v crontab >/dev/null 2>&1; then
+        if [[ "$OS" == "ubuntu" ]]; then
+            log_info "安装cron服务..."
+            sudo apt-get install -y cron
+        elif [[ "$OS" == "centos" ]]; then
+            log_info "安装cronie服务..."
+            sudo yum install -y cronie
+        fi
+    fi
+
+    # 确保cron服务在运行
+    if [[ "$OS" == "ubuntu" ]]; then
+        sudo systemctl enable cron
+        sudo systemctl start cron
+    elif [[ "$OS" == "centos" ]]; then
+        sudo systemctl enable crond
+        sudo systemctl start crond
+    fi
     
-    log_success "SSL证书自动续期配置完成"
+    # 添加到crontab
+    if command -v crontab >/dev/null 2>&1; then
+        (crontab -l 2>/dev/null; echo "0 2 * * * /usr/bin/certbot renew --quiet && systemctl reload nginx") | crontab -
+        log_success "SSL证书自动续期配置完成"
+    else
+        log_warning "无法配置自动续期，请手动添加以下命令到crontab："
+        echo "0 2 * * * /usr/bin/certbot renew --quiet && systemctl reload nginx"
+    fi
 }
 
 # 启动服务
