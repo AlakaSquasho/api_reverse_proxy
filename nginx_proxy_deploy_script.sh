@@ -18,6 +18,35 @@ NC='\033[0m' # No Color
 OS=""
 OS_VERSION=""
 
+# 状态目录（用于记录已完成的步骤，避免重复执行）
+STATE_DIR="/var/lib/api_reverse_proxy"
+
+# 创建状态目录（需要 sudo）
+ensure_state_dir() {
+    if [[ ! -d "$STATE_DIR" ]]; then
+        sudo mkdir -p "$STATE_DIR"
+        sudo chmod 755 "$STATE_DIR"
+    fi
+}
+
+# 在状态目录中创建标记文件
+create_marker() {
+    ensure_state_dir
+    sudo bash -c "echo \"$2\" > '$STATE_DIR/$1'"
+}
+
+# 检查标记文件是否存在
+marker_exists() {
+    [[ -f "$STATE_DIR/$1" ]]
+}
+
+# 读取状态文件内容（输出内容）
+read_state() {
+    if [[ -f "$STATE_DIR/$1" ]]; then
+        sudo cat "$STATE_DIR/$1"
+    fi
+}
+
 # 日志函数
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -146,6 +175,12 @@ collect_config() {
 install_dependencies() {
     log_info "安装依赖 (OS=$OS)..."
 
+    # 幂等检查：如果之前已成功安装过依赖则跳过
+    if marker_exists deps_installed; then
+        log_info "检测到依赖已安装，跳过此步骤"
+        return 0
+    fi
+
     if [[ "$OS" == "centos" ]]; then
         log_info "更新系统包..."
         sudo yum update -y
@@ -183,13 +218,17 @@ install_dependencies() {
         exit 1
     fi
 
+    # 标记已安装
+    create_marker deps_installed "installed"
+
     log_success "依赖安装完成"
 }
 
 # 配置防火墙（支持 firewalld 与 ufw）
 setup_firewall() {
     log_info "配置防火墙 (OS=$OS)..."
-    
+    ensure_state_dir
+
     if [[ "$OS" == "centos" ]]; then
         # 检查firewalld是否运行
         if ! sudo systemctl is-active --quiet firewalld; then
@@ -197,36 +236,44 @@ setup_firewall() {
             sudo systemctl start firewalld
             sudo systemctl enable firewalld
         fi
-        
-        # 保存现有防火墙规则
+
+        # 检查上次配置的端口（如果有），若相同则跳过配置
+        local desired_ports="${HTTPS_PORT}:${HTTP_PORT}"
+        local existing_config=$(read_state firewall_ports || true)
+        if [[ "$existing_config" == "$desired_ports" && $(sudo firewall-cmd --list-ports) ]]; then
+            log_info "防火墙已按需配置（端口 ${desired_ports}），跳过"
+            return 0
+        fi
+
+        # 保存现有防火墙规则（以便恢复）
         log_info "保存现有防火墙规则..."
         local existing_ports=$(sudo firewall-cmd --list-ports)
         log_info "当前开放的端口: $existing_ports"
-        
+
         # 确保基本服务端口开放
-        # SSH端口
         sudo firewall-cmd --permanent --add-port=22/tcp || true
-        # FTP端口
         sudo firewall-cmd --permanent --add-port=21/tcp || true
-        # DNS端口
         sudo firewall-cmd --permanent --add-port=53/tcp || true
         sudo firewall-cmd --permanent --add-port=53/udp || true
-        
+
         # 开放代理服务端口
-        sudo firewall-cmd --permanent --add-port=${HTTPS_PORT}/tcp
-        sudo firewall-cmd --permanent --add-port=${HTTP_PORT}/tcp
-        sudo firewall-cmd --permanent --add-port=80/tcp  # HTTP验证需要
-        sudo firewall-cmd --permanent --add-port=443/tcp # HTTPS标准端口
-        
-        # 如果有现有端口规则，重新添加
+        sudo firewall-cmd --permanent --add-port=${HTTPS_PORT}/tcp || true
+        sudo firewall-cmd --permanent --add-port=${HTTP_PORT}/tcp || true
+        sudo firewall-cmd --permanent --add-port=80/tcp || true
+        sudo firewall-cmd --permanent --add-port=443/tcp || true
+
+        # 如果有现有端口规则，确保也添加（防止覆盖）
         if [[ -n "$existing_ports" ]]; then
             for port in $existing_ports; do
                 sudo firewall-cmd --permanent --add-port=$port || true
             done
         fi
-        
+
         # 重新载入规则
         sudo firewall-cmd --reload
+
+        # 记录已配置的端口
+        create_marker firewall_ports "$desired_ports"
 
     elif [[ "$OS" == "ubuntu" ]]; then
         # 使用 ufw
@@ -234,10 +281,19 @@ setup_firewall() {
             log_info "安装 ufw..."
             sudo apt-get install -y ufw
         fi
+        ensure_state_dir
+
+        # 检查上次配置的端口（如果有），若相同则跳过配置
+        local desired_ports="${HTTPS_PORT}:${HTTP_PORT}"
+        local existing_config=$(read_state firewall_ports || true)
+        if [[ "$existing_config" == "$desired_ports" && $(sudo ufw status | grep -i "Status: active" >/dev/null 2>&1; echo $?) -eq 0 ]]; then
+            log_info "UFW 防火墙已按需配置（端口 ${desired_ports}），跳过"
+            return 0
+        fi
 
         # 保存现有防火墙规则
         log_info "保存现有 UFW 规则..."
-        local existing_rules=$(sudo ufw status numbered | grep ALLOW)
+        local existing_rules=$(sudo ufw status numbered | grep ALLOW || true)
         log_info "当前 UFW 规则: $existing_rules"
 
         # 确保基本服务端口开放（在启用 UFW 前）
@@ -259,6 +315,10 @@ setup_firewall() {
         else
             sudo ufw reload || true
         fi
+
+        # 记录已配置的端口
+        create_marker firewall_ports "$desired_ports"
+        fi
     else
         log_warning "跳过防火墙配置：未知操作系统 $OS"
     fi
@@ -269,6 +329,14 @@ setup_firewall() {
 # 获取SSL证书
 setup_ssl() {
     log_info "申请SSL证书..."
+    ensure_state_dir
+
+    # 如果证书已经存在，则跳过申请
+    if [[ -d "/etc/letsencrypt/live/${FULL_DOMAIN}" ]]; then
+        log_info "检测到已存在的证书 /etc/letsencrypt/live/${FULL_DOMAIN}，跳过申请"
+        create_marker "ssl_obtained_${FULL_DOMAIN}" "exists"
+        return 0
+    fi
     
     # 检查域名解析
     log_info "检查域名解析..."
@@ -286,6 +354,7 @@ setup_ssl() {
     # 申请证书
     if sudo certbot certonly --standalone -d "$FULL_DOMAIN" --email "$EMAIL" --agree-tos --non-interactive; then
         log_success "SSL证书申请成功"
+        create_marker "ssl_obtained_${FULL_DOMAIN}" "issued"
     else
         log_error "SSL证书申请失败，请检查域名解析和网络连接"
         exit 1
@@ -295,6 +364,16 @@ setup_ssl() {
 # 生成Nginx配置
 generate_nginx_config() {
     log_info "生成Nginx配置文件..."
+    ensure_state_dir
+
+    # 如果已经为该域名生成过代理配置且包含FULL_DOMAIN，则跳过
+    if [[ -f "/etc/nginx/conf.d/api-proxy.conf" ]]; then
+        if sudo grep -q "${FULL_DOMAIN}" /etc/nginx/conf.d/api-proxy.conf 2>/dev/null; then
+            log_info "检测到已存在的 Nginx 代理配置，跳过生成"
+            create_marker nginx_configured "${FULL_DOMAIN}"
+            return 0
+        fi
+    fi
     
     # 备份原配置
     sudo cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup.$(date +%Y%m%d_%H%M%S)
@@ -328,7 +407,7 @@ http {
     default_type application/octet-stream;
 
     # 速率限制配置
-    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=RATE_LIMITr/m;
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=RATE_LIMIT/m;
     limit_req_status 429;
 
     # Gzip压缩
@@ -494,7 +573,13 @@ EOF
 # 设置日志轮转
 setup_log_rotation() {
     log_info "配置日志轮转..."
-    
+
+    ensure_state_dir
+    if marker_exists logrotate_configured; then
+        log_info "日志轮转已配置，跳过"
+        return 0
+    fi
+
     sudo tee /etc/logrotate.d/nginx-api > /dev/null <<EOF
 /var/log/nginx/api_*.log {
     daily
@@ -510,6 +595,9 @@ setup_log_rotation() {
     endscript
 }
 EOF
+
+    # 标记已配置
+    create_marker logrotate_configured "done"
 
     log_success "日志轮转配置完成"
 }
@@ -538,9 +626,17 @@ setup_ssl_renewal() {
         sudo systemctl start crond
     fi
     
+    ensure_state_dir
+    if marker_exists ssl_renewal_configured; then
+        log_info "SSL 自动续期已配置，跳过"
+        return 0
+    fi
+
     # 添加到crontab
     if command -v crontab >/dev/null 2>&1; then
         (crontab -l 2>/dev/null; echo "0 2 * * * /usr/bin/certbot renew --quiet && systemctl reload nginx") | crontab -
+        # 标记已配置
+        create_marker ssl_renewal_configured "done"
         log_success "SSL证书自动续期配置完成"
     else
         log_warning "无法配置自动续期，请手动添加以下命令到crontab："
@@ -551,6 +647,16 @@ setup_ssl_renewal() {
 # 启动服务
 start_services() {
     log_info "启动服务..."
+    ensure_state_dir
+    # 如果已经启动并记录过，则跳过
+    if marker_exists services_started; then
+        if sudo systemctl is-active --quiet nginx; then
+            if sudo nginx -t >/dev/null 2>&1; then
+                log_info "Nginx 已在运行且配置通过，跳过启动"
+                return 0
+            fi
+        fi
+    fi
     
     # 验证配置
     if ! sudo nginx -t; then
@@ -567,6 +673,7 @@ start_services() {
     # 检查服务状态
     if sudo systemctl is-active --quiet nginx; then
         log_success "Nginx服务启动成功"
+        create_marker services_started "$(date -u +%Y%m%dT%H%M%SZ)"
     else
         log_error "Nginx服务启动失败"
         sudo systemctl status nginx
