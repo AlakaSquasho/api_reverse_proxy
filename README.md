@@ -21,6 +21,16 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/AlakaSquasho/api_reverse
 curl -fsSL https://raw.githubusercontent.com/AlakaSquasho/api_reverse_proxy/main/nginx_proxy_deploy_script.sh | bash
 ```
 
+### 一键卸载
+
+```bash
+# CentOS 7
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/AlakaSquasho/api_reverse_proxy/main/nginx_proxy_deploy_script.sh)" uninstall
+
+# Ubuntu
+curl -fsSL https://raw.githubusercontent.com/AlakaSquasho/api_reverse_proxy/main/nginx_proxy_deploy_script.sh | bash uninstall
+```
+
 ### 方式二：手动下载运行
 
 1. 下载脚本
@@ -35,7 +45,11 @@ chmod +x nginx_proxy_deploy_script.sh
 
 3. 运行脚本
 ```bash
+# 部署
 ./nginx_proxy_deploy_script.sh
+
+# 卸载
+./nginx_proxy_deploy_script.sh uninstall
 ```
 
 > 注意：脚本为幂等设计（会在第一次成功执行时记录状态），可安全重复执行。脚本会尽量跳过已完成的步骤（例如已安装的软件包、已申请的证书或已生成的配置），因此在出现中断后再次运行不会重复执行不必要的操作。
@@ -186,6 +200,58 @@ sudo rm -rf /var/lib/api_reverse_proxy
 ./nginx_proxy_deploy_script.sh
 ```
 
+## 卸载功能
+
+脚本支持完整的卸载功能，可以清理所有已安装的配置和文件。
+
+### 使用卸载命令
+
+**方式一：一键卸载**
+
+```bash
+# 如果已下载脚本
+./nginx_proxy_deploy_script.sh uninstall
+
+# 或通过 curl 一键卸载
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/AlakaSquasho/api_reverse_proxy/main/nginx_proxy_deploy_script.sh)" uninstall
+```
+
+**方式二：查看帮助**
+
+```bash
+./nginx_proxy_deploy_script.sh --help
+```
+
+### 卸载流程
+
+卸载命令会执行以下操作：
+
+1. **停止 Nginx 服务** - 停止并禁用 Nginx
+2. **删除代理配置** - 删除 `/etc/nginx/conf.d/api-proxy.conf`
+3. **删除 SSL 证书** - 删除 Let's Encrypt 证书文件
+4. **删除日志轮转配置** - 删除 `/etc/logrotate.d/nginx-api`
+5. **删除部署状态** - 删除 `/var/lib/api_reverse_proxy` 目录
+6. **移除自动续期任务** - 从 crontab 中移除 certbot 续期任务
+
+### 卸载注意事项
+
+- 卸载前会要求**两次确认**，防止误操作
+- Nginx 和 Certbot 应用本身不会被卸载，可通过包管理器手动卸载
+- SSL 证书会被删除，如需保留请先备份
+- 卸载后所有配置都会被清除，无法恢复
+
+### 手动卸载 Nginx 和 Certbot
+
+如果需要完全卸载应用本身，可运行：
+
+```bash
+# CentOS 7
+sudo yum remove -y nginx certbot
+
+# Ubuntu
+sudo apt-get remove -y nginx certbot
+```
+
 ## 注意事项
 
 1. 确保域名已正确解析到服务器
@@ -194,3 +260,4 @@ sudo rm -rf /var/lib/api_reverse_proxy
 4. 部署过程中如遇问题，请查看脚本生成的日志
 5. 状态标记文件需要 sudo 权限查看和修改
 6. 删除状态标记文件后重新运行脚本时，请确保环境满足相应操作的前置条件（如防火墙配置时请确保网络连接）
+7. 卸载是不可逆操作，请确保备份重要数据

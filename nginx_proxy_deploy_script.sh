@@ -835,39 +835,155 @@ cleanup_on_error() {
     exit 1
 }
 
-# 主函数
-main() {
+# 卸载函数
+uninstall() {
     echo "=========================================="
-    echo "     Nginx API反向代理一键部署脚本"
-    echo "     版本: 1.2 (添加Ubuntu支持)"
+    echo "     Nginx API反向代理卸载脚本"
     echo "=========================================="
     echo
     
-    # 如果标准输入被管道重定向，需要从终端读取用户输入
-    # 这样可以支持 curl ... | bash 的一键部署方式
-    if [[ ! -t 0 ]]; then
-        exec 0</dev/tty
+    log_warning "即将卸载 Nginx API反向代理服务"
+    read -p "确认卸载吗？这将删除所有配置和证书。(y/N): " CONFIRM
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        log_info "已取消卸载"
+        exit 0
     fi
     
-    # 设置错误处理
-    trap cleanup_on_error ERR
+    # 再次确认
+    log_warning "警告：此操作不可恢复！"
+    read -p "请再次确认卸载 (y/N): " CONFIRM2
+    if [[ "$CONFIRM2" != "y" && "$CONFIRM2" != "Y" ]]; then
+        log_info "已取消卸载"
+        exit 0
+    fi
     
-    # 执行部署步骤
-    #check_root
     check_system
-    collect_config
-    install_dependencies
-    setup_firewall
-    setup_ssl
-    generate_nginx_config
-    setup_log_rotation
-    setup_ssl_renewal
-    start_services
-    run_tests
-    generate_usage_doc
+    
+    log_info "开始卸载..."
+    
+    # 停止 Nginx 服务
+    log_info "停止 Nginx 服务..."
+    sudo systemctl stop nginx 2>/dev/null || true
+    sudo systemctl disable nginx 2>/dev/null || true
+    
+    # 删除 Nginx 配置和文件
+    log_info "删除 Nginx 配置..."
+    sudo rm -f /etc/nginx/conf.d/api-proxy.conf
+    sudo rm -f /etc/logrotate.d/nginx-api
+    
+    # 删除 SSL 证书（可选 - 注意：Let's Encrypt 有速率限制）
+    log_warning "删除 SSL 证书..."
+    sudo rm -rf /etc/letsencrypt/live
+    sudo rm -rf /etc/letsencrypt/archive
+    sudo rm -rf /etc/letsencrypt/renewal
+    
+    # 删除状态目录
+    log_info "删除部署状态记录..."
+    sudo rm -rf "$STATE_DIR"
+    
+    # 删除 crontab 中的自动续期任务
+    log_info "移除自动续期任务..."
+    (crontab -l 2>/dev/null | grep -v "certbot renew" | crontab -) || true
+    
+    log_success "卸载完成！"
     
     echo
-    log_success "部署完成！"
+    log_info "已删除的内容："
+    echo "  - Nginx 代理配置 (/etc/nginx/conf.d/api-proxy.conf)"
+    echo "  - SSL 证书 (/etc/letsencrypt/)"
+    echo "  - 日志轮转配置 (/etc/logrotate.d/nginx-api)"
+    echo "  - 部署状态记录 (${STATE_DIR})"
+    echo "  - 自动续期 cron 任务"
+    echo
+    log_info "以下内容已保留（如需要请手动删除）："
+    echo "  - Nginx 应用本身（可通过包管理器卸载）"
+    echo "  - Certbot（可通过包管理器卸载）"
+    echo
+    log_info "如需完全卸载 Nginx 和 Certbot，请执行："
+    if [[ "$OS" == "centos" ]]; then
+        echo "  sudo yum remove -y nginx certbot"
+    elif [[ "$OS" == "ubuntu" ]]; then
+        echo "  sudo apt-get remove -y nginx certbot"
+    fi
+}
+
+# 主函数
+main() {
+    # 处理命令行参数
+    case "${1:-install}" in
+        install|"")
+            # 部署模式
+            echo "=========================================="
+            echo "     Nginx API反向代理一键部署脚本"
+            echo "     版本: 1.2 (添加Ubuntu支持)"
+            echo "=========================================="
+            echo
+            
+            # 如果标准输入被管道重定向，需要从终端读取用户输入
+            # 这样可以支持 curl ... | bash 的一键部署方式
+            if [[ ! -t 0 ]]; then
+                exec 0</dev/tty
+            fi
+            
+            # 设置错误处理
+            trap cleanup_on_error ERR
+            
+            # 执行部署步骤
+            #check_root
+            check_system
+            collect_config
+            install_dependencies
+            setup_firewall
+            setup_ssl
+            generate_nginx_config
+            setup_log_rotation
+            setup_ssl_renewal
+            start_services
+            run_tests
+            generate_usage_doc
+            
+            echo
+            log_success "部署完成！"
+            ;;
+        
+        uninstall)
+            # 卸载模式
+            if [[ ! -t 0 ]]; then
+                exec 0</dev/tty
+            fi
+            uninstall
+            ;;
+        
+        --help|-h)
+            # 显示帮助信息
+            echo "Nginx API反向代理部署脚本"
+            echo
+            echo "用法:"
+            echo "  $0 [命令]"
+            echo
+            echo "命令:"
+            echo "  install      部署 Nginx API反向代理（默认）"
+            echo "  uninstall    卸载 Nginx API反向代理"
+            echo "  --help, -h   显示此帮助信息"
+            echo
+            echo "示例:"
+            echo "  $0                # 部署"
+            echo "  $0 install        # 部署"
+            echo "  $0 uninstall      # 卸载"
+            echo
+            echo "一键部署命令:"
+            echo "  bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/AlakaSquasho/api_reverse_proxy/main/nginx_proxy_deploy_script.sh)\""
+            echo
+            echo "一键卸载命令:"
+            echo "  bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/AlakaSquasho/api_reverse_proxy/main/nginx_proxy_deploy_script.sh)\" uninstall"
+            ;;
+        
+        *)
+            log_error "未知命令: $1"
+            echo "使用 '$0 --help' 查看帮助信息"
+            exit 1
+            ;;
+    esac
 }
 
 # 运行主函数
