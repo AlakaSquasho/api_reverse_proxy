@@ -318,7 +318,7 @@ setup_firewall() {
 
         # 记录已配置的端口
         create_marker firewall_ports "$desired_ports"
-        fi
+
     else
         log_warning "跳过防火墙配置：未知操作系统 $OS"
     fi
