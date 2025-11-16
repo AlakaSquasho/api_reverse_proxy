@@ -843,6 +843,12 @@ main() {
     echo "=========================================="
     echo
     
+    # 如果标准输入被管道重定向，需要从终端读取用户输入
+    # 这样可以支持 curl ... | bash 的一键部署方式
+    if [[ ! -t 0 ]]; then
+        exec 0</dev/tty
+    fi
+    
     # 设置错误处理
     trap cleanup_on_error ERR
     
