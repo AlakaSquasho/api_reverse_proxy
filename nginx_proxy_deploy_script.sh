@@ -111,42 +111,135 @@ check_system() {
     exit 1
 }
 
+# 从现有配置文件中读取配置信息
+load_existing_config() {
+    local config_file="/etc/nginx/conf.d/api-proxy.conf"
+    local nginx_conf="/etc/nginx/nginx.conf"
+    
+    # 检查配置文件是否存在
+    if [[ ! -f "$config_file" ]]; then
+        return 1
+    fi
+    
+    # 读取域名 (server_name)
+    FULL_DOMAIN=$(sudo grep -oP 'server_name\s+\K[^;]+' "$config_file" 2>/dev/null | head -n1 | tr -d ' ')
+    if [[ -n "$FULL_DOMAIN" ]]; then
+        # 从 FULL_DOMAIN 提取 SUBDOMAIN 和 DOMAIN
+        SUBDOMAIN=$(echo "$FULL_DOMAIN" | cut -d'.' -f1)
+        DOMAIN=$(echo "$FULL_DOMAIN" | cut -d'.' -f2-)
+    fi
+    
+    # 读取 HTTPS 端口
+    HTTPS_PORT=$(sudo grep -oP 'listen\s+\K[0-9]+(?=\s+ssl)' "$config_file" 2>/dev/null | head -n1)
+    
+    # 读取 HTTP 端口 (从非 SSL 的 listen 指令)
+    HTTP_PORT=$(sudo grep -oP '^\s*listen\s+\K[0-9]+(?=;)' "$config_file" 2>/dev/null | head -n1)
+    
+    # 读取速率限制 (从 nginx.conf)
+    if [[ -f "$nginx_conf" ]]; then
+        RATE_LIMIT=$(sudo grep -oP 'rate=\K[0-9]+(?=/m)' "$nginx_conf" 2>/dev/null | head -n1)
+    fi
+    
+    # 读取突发限制
+    BURST_LIMIT=$(sudo grep -oP 'burst=\K[0-9]+' "$config_file" 2>/dev/null | head -n1)
+    
+    # 读取邮箱 (从 certbot 配置)
+    if [[ -d "/etc/letsencrypt/renewal" && -n "$FULL_DOMAIN" ]]; then
+        local renewal_conf="/etc/letsencrypt/renewal/${FULL_DOMAIN}.conf"
+        if [[ -f "$renewal_conf" ]]; then
+            EMAIL=$(sudo grep -oP '^email\s*=\s*\K.+' "$renewal_conf" 2>/dev/null | tr -d ' ')
+        fi
+    fi
+    
+    # 检查是否所有必要配置都已读取
+    if [[ -n "$FULL_DOMAIN" && -n "$HTTPS_PORT" && -n "$HTTP_PORT" ]]; then
+        return 0
+    fi
+    
+    return 1
+}
+
 # 收集用户配置
 collect_config() {
+    log_info "检查现有配置..."
+    
+    # 尝试从现有配置加载
+    local config_loaded=false
+    if load_existing_config; then
+        config_loaded=true
+        log_success "检测到现有配置:"
+        echo "  域名: $FULL_DOMAIN"
+        echo "  HTTPS端口: $HTTPS_PORT"
+        echo "  HTTP端口: $HTTP_PORT"
+        [[ -n "$RATE_LIMIT" ]] && echo "  速率限制: ${RATE_LIMIT}次/分钟"
+        [[ -n "$BURST_LIMIT" ]] && echo "  突发限制: $BURST_LIMIT"
+        [[ -n "$EMAIL" ]] && echo "  邮箱: $EMAIL"
+        echo
+        
+        read -p "是否使用现有配置? (Y/n): " USE_EXISTING
+        if [[ "$USE_EXISTING" != "n" && "$USE_EXISTING" != "N" ]]; then
+            # 设置默认值（如果某些配置未读取到）
+            RATE_LIMIT=${RATE_LIMIT:-100}
+            BURST_LIMIT=${BURST_LIMIT:-20}
+            EMAIL=${EMAIL:-"admin@${DOMAIN}"}
+            log_success "使用现有配置继续部署"
+            return 0
+        fi
+        log_info "将重新配置服务..."
+    fi
+    
     log_info "开始收集配置信息..."
     
     # 域名配置
+    local default_domain=""
+    [[ -n "$DOMAIN" ]] && default_domain=" (当前: $DOMAIN)"
     while true; do
-        read -p "请输入您的域名 (例如: mydomain.com): " DOMAIN
-        if [[ -n "$DOMAIN" ]]; then
+        read -p "请输入您的域名${default_domain} (例如: mydomain.com): " input_domain
+        input_domain=${input_domain:-$DOMAIN}
+        if [[ -n "$input_domain" ]]; then
+            DOMAIN="$input_domain"
             break
         fi
         log_warning "域名不能为空，请重新输入"
     done
     
     # 子域名配置
-    read -p "请输入子域名前缀 (默认: api): " SUBDOMAIN
-    SUBDOMAIN=${SUBDOMAIN:-api}
+    local default_subdomain="api"
+    [[ -n "$SUBDOMAIN" ]] && default_subdomain="$SUBDOMAIN"
+    read -p "请输入子域名前缀 (默认: $default_subdomain): " input_subdomain
+    SUBDOMAIN=${input_subdomain:-$default_subdomain}
     FULL_DOMAIN="${SUBDOMAIN}.${DOMAIN}"
     
     # 端口配置
-    read -p "请输入HTTPS端口 (默认: 8443): " HTTPS_PORT
-    HTTPS_PORT=${HTTPS_PORT:-8443}
+    local default_https="8443"
+    [[ -n "$HTTPS_PORT" ]] && default_https="$HTTPS_PORT"
+    read -p "请输入HTTPS端口 (默认: $default_https): " input_https
+    HTTPS_PORT=${input_https:-$default_https}
     
-    read -p "请输入HTTP端口 (默认: 8080): " HTTP_PORT
-    HTTP_PORT=${HTTP_PORT:-8080}
+    local default_http="8080"
+    [[ -n "$HTTP_PORT" ]] && default_http="$HTTP_PORT"
+    read -p "请输入HTTP端口 (默认: $default_http): " input_http
+    HTTP_PORT=${input_http:-$default_http}
     
     # 速率限制配置
-    read -p "请输入每分钟请求限制 (默认: 100): " RATE_LIMIT
-    RATE_LIMIT=${RATE_LIMIT:-100}
+    local default_rate="100"
+    [[ -n "$RATE_LIMIT" ]] && default_rate="$RATE_LIMIT"
+    read -p "请输入每分钟请求限制 (默认: $default_rate): " input_rate
+    RATE_LIMIT=${input_rate:-$default_rate}
     
-    read -p "请输入突发请求限制 (默认: 20): " BURST_LIMIT
-    BURST_LIMIT=${BURST_LIMIT:-20}
+    local default_burst="20"
+    [[ -n "$BURST_LIMIT" ]] && default_burst="$BURST_LIMIT"
+    read -p "请输入突发请求限制 (默认: $default_burst): " input_burst
+    BURST_LIMIT=${input_burst:-$default_burst}
     
     # 邮箱配置（用于SSL证书）
+    local default_email=""
+    [[ -n "$EMAIL" ]] && default_email=" (当前: $EMAIL)"
     while true; do
-        read -p "请输入您的邮箱地址 (用于SSL证书申请): " EMAIL
-        if [[ "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        read -p "请输入您的邮箱地址${default_email} (用于SSL证书申请): " input_email
+        input_email=${input_email:-$EMAIL}
+        if [[ "$input_email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+            EMAIL="$input_email"
             break
         fi
         log_warning "邮箱格式不正确，请重新输入"
@@ -850,6 +943,28 @@ sudo certbot renew
 - 代理配置: /etc/nginx/conf.d/api-proxy.conf
 - SSL证书: /etc/letsencrypt/live/${FULL_DOMAIN}/
 - 日志文件: /var/log/nginx/
+- 部署状态: /var/lib/api_reverse_proxy/
+
+修改配置说明:
+--------------
+如需修改已配置的服务信息，请编辑以下文件:
+
+1. 修改域名/端口/突发限制:
+   文件: /etc/nginx/conf.d/api-proxy.conf
+   - 域名: 搜索 "server_name" 和 "ssl_certificate" 行
+   - HTTPS端口: 搜索 "listen ... ssl" 行
+   - HTTP端口: 搜索 "listen" (非 ssl) 行
+   - 突发限制: 搜索 "burst=" 参数
+
+2. 修改速率限制:
+   文件: /etc/nginx/nginx.conf
+   - 搜索 "limit_req_zone" 行中的 "rate=" 参数
+
+3. 修改SSL证书邮箱:
+   文件: /etc/letsencrypt/renewal/${FULL_DOMAIN}.conf
+   - 搜索 "email = " 行
+
+修改后执行: sudo nginx -t && sudo systemctl reload nginx
 
 安全注意事项:
 --------------
@@ -1021,6 +1136,10 @@ main() {
             echo
             echo "一键卸载命令:"
             echo "  bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/AlakaSquasho/api_reverse_proxy/main/nginx_proxy_deploy_script.sh)\" uninstall"
+            echo
+            echo "注意:"
+            echo "  - 脚本会自动检测现有配置，如果已配置过则可跳过输入步骤"
+            echo "  - 如需修改配置，请查看 /tmp/nginx_proxy_usage.txt 中的 '修改配置说明' 部分"
             ;;
         
         *)
