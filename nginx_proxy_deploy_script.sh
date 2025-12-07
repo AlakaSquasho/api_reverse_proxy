@@ -437,6 +437,11 @@ upstream openai_api {
     keepalive 32;
 }
 
+upstream claude_api {
+    server api.anthropic.com:443;
+    keepalive 32;
+}
+
 # 主服务器配置
 server {
     listen HTTPS_PORT ssl http2;
@@ -521,6 +526,34 @@ server {
         rewrite ^/openai/(.*)$ /$1 break;
     }
 
+    # Claude API代理
+    location /claude/ {
+        # 应用速率限制
+        limit_req zone=api_limit burst=BURST_LIMIT nodelay;
+        
+        # 代理配置
+        proxy_pass https://claude_api/;
+        proxy_ssl_server_name on;
+        proxy_ssl_name api.anthropic.com;
+        proxy_ssl_verify off;
+        
+        # 请求头配置
+        proxy_set_header Host api.anthropic.com;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # 连接配置
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        
+        # 去除路径前缀
+        rewrite ^/claude/(.*)$ /$1 break;
+    }
+
     # 健康检查端点
     location /health {
         access_log off;
@@ -537,7 +570,7 @@ server {
 
     # 默认返回404
     location / {
-        return 404 '{"error":"Not Found","message":"Available endpoints: /gemini/, /openai/, /health, /status"}';
+        return 404 '{"error":"Not Found","message":"Available endpoints: /gemini/, /openai/, /claude/, /health, /status"}';
         add_header Content-Type application/json;
     }
 }
@@ -751,10 +784,21 @@ Nginx API反向代理服务部署完成
    curl "https://${FULL_DOMAIN}:${HTTPS_PORT}/openai/v1/models" \\
      -H "Authorization: Bearer YOUR_API_KEY"
 
-3. 健康检查:
+3. Claude API代理:
+   原始地址: https://api.anthropic.com/v1/messages
+   代理地址: https://${FULL_DOMAIN}:${HTTPS_PORT}/claude/v1/messages
+
+   示例:
+   curl "https://${FULL_DOMAIN}:${HTTPS_PORT}/claude/v1/messages" \\
+     -H "x-api-key: YOUR_API_KEY" \\
+     -H "anthropic-version: 2023-06-01" \\
+     -H "content-type: application/json" \\
+     -d '{"model": "claude-3-opus-20240229", "max_tokens": 1024, "messages": [{"role": "user", "content": "Hello"}]}'
+
+4. 健康检查:
    curl "https://${FULL_DOMAIN}:${HTTPS_PORT}/health"
 
-4. 状态监控:
+5. 状态监控:
    curl "https://${FULL_DOMAIN}:${HTTPS_PORT}/status"
 
 管理命令:
@@ -798,6 +842,7 @@ sudo certbot renew
 3. 如果代理失败，检查上游服务器连接:
    curl -I https://generativelanguage.googleapis.com
    curl -I https://api.openai.com
+   curl -I https://api.anthropic.com
 
 配置文件位置:
 --------------
